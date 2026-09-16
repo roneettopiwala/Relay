@@ -4,29 +4,20 @@
 package main
 
 import (
-	"bytes"
+	"context"
 	"encoding/json"
+	"errors"
 	"flag"
 	"fmt"
-	"io"
 	"net/http"
 	"os"
 	"sort"
 	"sync"
 	"sync/atomic"
 	"time"
+
+	"github.com/roneettopiwala/relay/internal/relayclient"
 )
-
-type submitReq struct {
-	Image          string   `json:"image"`
-	Cmd            []string `json:"cmd"`
-	TimeoutSeconds int      `json:"timeout_seconds"`
-}
-
-type taskResp struct {
-	ID     string `json:"id"`
-	Status string `json:"status"`
-}
 
 type statsResp struct {
 	Pending      int `json:"pending"`
@@ -38,10 +29,11 @@ type statsResp struct {
 }
 
 type submitResult struct {
-	id       string
-	err      error
-	latency  time.Duration
-	submitAt time.Time
+	id         string
+	statusCode int
+	err        error
+	latency    time.Duration
+	submitAt   time.Time
 }
 
 func main() {
@@ -61,14 +53,17 @@ func main() {
 	statsInterval := flag.Duration("stats-interval", 50*time.Millisecond, "how often to sample /stats for worker utilization")
 	flag.Parse()
 
+	ctx := context.Background()
+
 	// The default transport keeps only 2 idle connections per host, which
 	// would serialize most of a high -c run at the TCP layer and make this
 	// tool the bottleneck instead of the server. Give it enough headroom to
 	// actually sustain the concurrency it's supposed to be generating.
-	client := &http.Client{
+	httpClient := &http.Client{
 		Timeout:   15 * time.Second,
 		Transport: &http.Transport{MaxIdleConnsPerHost: *c + 1},
 	}
+	rc := relayclient.New(*url, httpClient)
 
 	fmt.Printf("Relay load test: n=%d concurrency=%d url=%s cmd=%q\n", *n, *c, *url, *cmdStr)
 
@@ -87,7 +82,7 @@ func main() {
 			case <-stopStats:
 				return
 			case <-ticker.C:
-				s, err := getStats(client, *url)
+				s, err := getStats(httpClient, *url)
 				if err != nil {
 					continue
 				}
@@ -106,7 +101,7 @@ func main() {
 	}()
 
 	// --- Phase A: submit all n tasks through c concurrent goroutines ---
-	body := submitReq{Image: *image, Cmd: []string{"sh", "-c", *cmdStr}, TimeoutSeconds: *timeoutSec}
+	body := relayclient.SubmitRequest{Image: *image, Cmd: []string{"sh", "-c", *cmdStr}, TimeoutSeconds: timeoutSec}
 	jobs := make(chan int, *n)
 	for i := 0; i < *n; i++ {
 		jobs <- i
@@ -122,29 +117,43 @@ func main() {
 			defer subWG.Done()
 			for idx := range jobs {
 				start := time.Now()
-				id, err := submitTask(client, *url, body)
-				results[idx] = submitResult{id: id, err: err, latency: time.Since(start), submitAt: start}
+				t, err := rc.Submit(ctx, body)
+				statusCode := 0
+				var apiErr *relayclient.APIError
+				if errors.As(err, &apiErr) {
+					statusCode = apiErr.StatusCode
+				}
+				results[idx] = submitResult{
+					id: t.ID, statusCode: statusCode, err: err,
+					latency: time.Since(start), submitAt: start,
+				}
 			}
 		}()
 	}
 	subWG.Wait()
 	submitDuration := time.Since(wallStart)
 
-	var submitOK, submitErrs int
+	var submitOK, submitRejected, submitErrs int
 	submitLatencies := make([]time.Duration, 0, *n)
 	ids := make([]string, 0, *n)
 	submitAt := make(map[string]time.Time, *n)
 	for _, r := range results {
 		submitLatencies = append(submitLatencies, r.latency)
-		if r.err != nil {
+		switch {
+		case r.err == nil:
+			submitOK++
+			ids = append(ids, r.id)
+			submitAt[r.id] = r.submitAt
+		case r.statusCode == http.StatusServiceUnavailable:
+			// Backpressure doing its job, not a bug — the server explicitly
+			// shed this request rather than accept an unbounded backlog.
+			submitRejected++
+		default:
 			submitErrs++
-			continue
 		}
-		submitOK++
-		ids = append(ids, r.id)
-		submitAt[r.id] = r.submitAt
 	}
-	fmt.Printf("submitted %d/%d ok (%d errors) in %s\n", submitOK, *n, submitErrs, submitDuration)
+	fmt.Printf("submitted %d/%d ok (%d rejected by backpressure, %d other errors) in %s\n",
+		submitOK, *n, submitRejected, submitErrs, submitDuration)
 
 	// --- Phase B: poll every submitted task to a terminal state ---
 	pollConcurrency := *c
@@ -169,18 +178,21 @@ func main() {
 		go func() {
 			defer pollWG.Done()
 			for id := range pollJobs {
-				status, terminalAt, isStuck := pollUntilTerminal(client, *url, id, *pollInterval, *pollTimeout)
-				if isStuck {
+				t, err := rc.WaitForTerminal(ctx, id, *pollInterval, *pollTimeout)
+				if err != nil {
+					// ErrPollTimeout ("stuck") and a genuine request error are
+					// both treated as stuck here — either way this id never
+					// resolved to a terminal state within the budget.
 					atomic.AddInt32(&stuck, 1)
 					continue
 				}
-				switch status {
+				switch t.Status {
 				case "completed":
 					atomic.AddInt32(&completed, 1)
 				case "failed":
 					atomic.AddInt32(&failed, 1)
 				}
-				lat := terminalAt.Sub(submitAt[id])
+				lat := time.Since(submitAt[id])
 				e2eMu.Lock()
 				e2eLatencies = append(e2eLatencies, lat)
 				e2eMu.Unlock()
@@ -213,6 +225,7 @@ func main() {
 	fmt.Println("=== Relay Load Test Report ===")
 	fmt.Printf("requested:          %d\n", *n)
 	fmt.Printf("submitted (202):    %d\n", submitOK)
+	fmt.Printf("rejected (503, backpressure): %d\n", submitRejected)
 	fmt.Printf("submit errors:      %d\n", submitErrs)
 	fmt.Printf("completed:          %d\n", finalCompleted)
 	fmt.Printf("failed:             %d\n", finalFailed)
@@ -237,48 +250,8 @@ func main() {
 	os.Exit(1)
 }
 
-func submitTask(client *http.Client, base string, body submitReq) (string, error) {
-	b, err := json.Marshal(body)
-	if err != nil {
-		return "", err
-	}
-	resp, err := client.Post(base+"/tasks", "application/json", bytes.NewReader(b))
-	if err != nil {
-		return "", err
-	}
-	defer resp.Body.Close()
-	data, _ := io.ReadAll(resp.Body)
-	if resp.StatusCode != http.StatusAccepted {
-		return "", fmt.Errorf("status %d: %s", resp.StatusCode, data)
-	}
-	var t taskResp
-	if err := json.Unmarshal(data, &t); err != nil {
-		return "", err
-	}
-	return t.ID, nil
-}
-
-// pollUntilTerminal polls until the task is completed/failed or pollTimeout
-// passes, in which case stuck is true — that's the "lost or hung task" signal
-// the load test's PASS/FAIL check treats as a hard failure.
-func pollUntilTerminal(client *http.Client, base, id string, interval, pollTimeout time.Duration) (status string, terminalAt time.Time, stuck bool) {
-	deadline := time.Now().Add(pollTimeout)
-	for {
-		if resp, err := client.Get(base + "/tasks/" + id); err == nil {
-			data, _ := io.ReadAll(resp.Body)
-			resp.Body.Close()
-			var t taskResp
-			if json.Unmarshal(data, &t) == nil && (t.Status == "completed" || t.Status == "failed") {
-				return t.Status, time.Now(), false
-			}
-		}
-		if time.Now().After(deadline) {
-			return "", time.Time{}, true
-		}
-		time.Sleep(interval)
-	}
-}
-
+// getStats is loadtest-specific (worker-utilization sampling isn't part of
+// relayclient's submit/poll job), so it stays a small local helper.
 func getStats(client *http.Client, base string) (statsResp, error) {
 	resp, err := client.Get(base + "/stats")
 	if err != nil {

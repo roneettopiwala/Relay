@@ -8,16 +8,20 @@ package task
 
 import "time"
 
-// Status is a task's position in its lifecycle. These four values are the whole
-// set: a task that times out or whose container exits non-zero is StatusFailed
-// with an explanatory Error, not a distinct "timeout"/"cancelled" status.
+// Status is a task's position in its lifecycle. A task that times out or
+// whose container exits non-zero is StatusFailed with an explanatory Error,
+// not a distinct "timeout"/"cancelled" status — the one exception is
+// StatusRetrying (Phase 2), which exists specifically to make a scheduled
+// retry observable, rather than have a backing-off task look identical to a
+// fresh StatusPending one or a StatusFailed one it hasn't actually reached yet.
 type Status string
 
 const (
 	StatusPending   Status = "pending"   // accepted, waiting for a free worker
 	StatusRunning   Status = "running"   // handed to a worker, executor in progress
 	StatusCompleted Status = "completed" // executor returned exit code 0
-	StatusFailed    Status = "failed"    // non-zero exit, timeout, or executor error
+	StatusFailed    Status = "failed"    // permanently failed: non-zero exit, shutdown, or retries exhausted
+	StatusRetrying  Status = "retrying"  // a retryable failure happened; waiting out a backoff before the next attempt
 )
 
 // Spec is the immutable description of what to run. It is supplied by the API
@@ -75,8 +79,8 @@ type Task struct {
 	Output     string     `json:"output,omitempty"`
 	Error      string     `json:"error,omitempty"`
 
-	// Attempts is always 0 in Phase 1. It exists now so the Phase 2 retry /
-	// dead-letter path is a behaviour change, not a schema change.
+	// Attempts is the number of retries issued so far (0 = still on the
+	// first attempt, or it succeeded/permanently failed without retrying).
 	Attempts int `json:"attempts"`
 }
 

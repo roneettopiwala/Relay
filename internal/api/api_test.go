@@ -8,6 +8,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -15,28 +16,51 @@ import (
 	"github.com/roneettopiwala/relay/internal/dispatch"
 	"github.com/roneettopiwala/relay/internal/store"
 	"github.com/roneettopiwala/relay/internal/task"
+	"github.com/roneettopiwala/relay/internal/testutil"
 )
 
-// sleepExecutor is a controllable no-Docker test double: it just waits, so
-// these tests exercise routing/validation/async-ness without any container.
-type sleepExecutor struct{ delay time.Duration }
-
-func (s sleepExecutor) Execute(ctx context.Context, t task.Task) (task.Result, error) {
-	select {
-	case <-time.After(s.delay):
-		return task.Result{ExitCode: 0, Output: "ok"}, nil
-	case <-ctx.Done():
-		return task.Result{}, ctx.Err()
-	}
+// memDeadLetterQueue is an in-memory dispatch.DeadLetterQueue test double.
+type memDeadLetterQueue struct {
+	mu      sync.Mutex
+	entries []dispatch.DeadLetterEntry
 }
+
+func (q *memDeadLetterQueue) Record(ctx context.Context, entry dispatch.DeadLetterEntry) error {
+	q.mu.Lock()
+	q.entries = append(q.entries, entry)
+	q.mu.Unlock()
+	return nil
+}
+
+func (q *memDeadLetterQueue) List(ctx context.Context, limit int) ([]dispatch.DeadLetterEntry, error) {
+	q.mu.Lock()
+	defer q.mu.Unlock()
+	out := make([]dispatch.DeadLetterEntry, 0, len(q.entries))
+	for i := len(q.entries) - 1; i >= 0 && len(out) < limit; i-- { // most-recent-first
+		out = append(out, q.entries[i])
+	}
+	return out, nil
+}
+
+var testLimits = api.Limits{MaxCPU: 2.0, MaxMemBytes: 512 * 1024 * 1024, MaxTimeout: 60 * time.Second}
 
 func newTestAPI(t *testing.T, workers int, exec dispatch.Executor) *api.API {
 	t.Helper()
+	a, _ := newTestAPIWithDLQ(t, workers, exec)
+	return a
+}
+
+// newTestAPIWithDLQ is like newTestAPI but also returns the dead-letter
+// queue backing the dispatcher, for tests that need to observe what got
+// recorded to it.
+func newTestAPIWithDLQ(t *testing.T, workers int, exec dispatch.Executor) (*api.API, *memDeadLetterQueue) {
+	t.Helper()
 	st := store.New()
-	d := dispatch.New(st, workers, exec)
+	dlq := &memDeadLetterQueue{}
+	d := dispatch.New(st, exec, testutil.NewFakeQueue(), dlq, dispatch.Config{Workers: workers})
 	t.Cleanup(func() { d.Shutdown(context.Background()) })
 	defaults := task.Defaults{Image: "alpine", CPULimit: 0.5, MemLimit: "128m", Timeout: 30 * time.Second}
-	return api.New(st, d, defaults, 2.0, 512*1024*1024, 60*time.Second)
+	return api.New(st, d, dlq, defaults, testLimits), dlq
 }
 
 func doJSON(t *testing.T, h http.Handler, method, path string, body any) *httptest.ResponseRecorder {
@@ -66,7 +90,7 @@ func decodeTask(t *testing.T, rec *httptest.ResponseRecorder) task.Task {
 }
 
 func TestSubmit_Success(t *testing.T) {
-	a := newTestAPI(t, 2, sleepExecutor{delay: 10 * time.Millisecond})
+	a := newTestAPI(t, 2, testutil.SleepExecutor{Delay: 10 * time.Millisecond})
 	rec := doJSON(t, a.Routes(), http.MethodPost, "/tasks", map[string]any{
 		"image": "alpine", "cmd": []string{"echo", "hi"},
 	})
@@ -83,7 +107,7 @@ func TestSubmit_Success(t *testing.T) {
 }
 
 func TestSubmit_MissingCmd(t *testing.T) {
-	a := newTestAPI(t, 1, sleepExecutor{delay: time.Millisecond})
+	a := newTestAPI(t, 1, testutil.SleepExecutor{Delay: time.Millisecond})
 	rec := doJSON(t, a.Routes(), http.MethodPost, "/tasks", map[string]any{"image": "alpine"})
 	if rec.Code != http.StatusBadRequest {
 		t.Errorf("status = %d, want 400; body=%s", rec.Code, rec.Body)
@@ -91,7 +115,7 @@ func TestSubmit_MissingCmd(t *testing.T) {
 }
 
 func TestSubmit_MalformedJSON(t *testing.T) {
-	a := newTestAPI(t, 1, sleepExecutor{delay: time.Millisecond})
+	a := newTestAPI(t, 1, testutil.SleepExecutor{Delay: time.Millisecond})
 	req := httptest.NewRequest(http.MethodPost, "/tasks", strings.NewReader("{not valid json"))
 	rec := httptest.NewRecorder()
 	a.Routes().ServeHTTP(rec, req)
@@ -101,7 +125,7 @@ func TestSubmit_MalformedJSON(t *testing.T) {
 }
 
 func TestSubmit_CPUsOverMax(t *testing.T) {
-	a := newTestAPI(t, 1, sleepExecutor{delay: time.Millisecond})
+	a := newTestAPI(t, 1, testutil.SleepExecutor{Delay: time.Millisecond})
 	rec := doJSON(t, a.Routes(), http.MethodPost, "/tasks", map[string]any{
 		"cmd": []string{"x"}, "cpus": 64.0,
 	})
@@ -111,7 +135,7 @@ func TestSubmit_CPUsOverMax(t *testing.T) {
 }
 
 func TestSubmit_CPUsNonPositive(t *testing.T) {
-	a := newTestAPI(t, 1, sleepExecutor{delay: time.Millisecond})
+	a := newTestAPI(t, 1, testutil.SleepExecutor{Delay: time.Millisecond})
 	rec := doJSON(t, a.Routes(), http.MethodPost, "/tasks", map[string]any{
 		"cmd": []string{"x"}, "cpus": -1.0,
 	})
@@ -121,7 +145,7 @@ func TestSubmit_CPUsNonPositive(t *testing.T) {
 }
 
 func TestSubmit_MemoryOverMax(t *testing.T) {
-	a := newTestAPI(t, 1, sleepExecutor{delay: time.Millisecond})
+	a := newTestAPI(t, 1, testutil.SleepExecutor{Delay: time.Millisecond})
 	rec := doJSON(t, a.Routes(), http.MethodPost, "/tasks", map[string]any{
 		"cmd": []string{"x"}, "memory": "4g",
 	})
@@ -131,7 +155,7 @@ func TestSubmit_MemoryOverMax(t *testing.T) {
 }
 
 func TestSubmit_InvalidMemoryFormat(t *testing.T) {
-	a := newTestAPI(t, 1, sleepExecutor{delay: time.Millisecond})
+	a := newTestAPI(t, 1, testutil.SleepExecutor{Delay: time.Millisecond})
 	rec := doJSON(t, a.Routes(), http.MethodPost, "/tasks", map[string]any{
 		"cmd": []string{"x"}, "memory": "lots",
 	})
@@ -141,7 +165,7 @@ func TestSubmit_InvalidMemoryFormat(t *testing.T) {
 }
 
 func TestSubmit_TimeoutOverMax(t *testing.T) {
-	a := newTestAPI(t, 1, sleepExecutor{delay: time.Millisecond})
+	a := newTestAPI(t, 1, testutil.SleepExecutor{Delay: time.Millisecond})
 	rec := doJSON(t, a.Routes(), http.MethodPost, "/tasks", map[string]any{
 		"cmd": []string{"x"}, "timeout_seconds": 3600,
 	})
@@ -151,7 +175,7 @@ func TestSubmit_TimeoutOverMax(t *testing.T) {
 }
 
 func TestGet_NotFound(t *testing.T) {
-	a := newTestAPI(t, 1, sleepExecutor{delay: time.Millisecond})
+	a := newTestAPI(t, 1, testutil.SleepExecutor{Delay: time.Millisecond})
 	rec := doJSON(t, a.Routes(), http.MethodGet, "/tasks/does-not-exist", nil)
 	if rec.Code != http.StatusNotFound {
 		t.Errorf("status = %d, want 404", rec.Code)
@@ -159,7 +183,7 @@ func TestGet_NotFound(t *testing.T) {
 }
 
 func TestGet_Found(t *testing.T) {
-	a := newTestAPI(t, 1, sleepExecutor{delay: time.Millisecond})
+	a := newTestAPI(t, 1, testutil.SleepExecutor{Delay: time.Millisecond})
 	submitted := decodeTask(t, doJSON(t, a.Routes(), http.MethodPost, "/tasks", map[string]any{
 		"cmd": []string{"x"},
 	}))
@@ -179,7 +203,7 @@ func TestGet_Found(t *testing.T) {
 // must still return in milliseconds (queued as pending), not wait for a
 // worker to free up.
 func TestSubmit_DoesNotBlockOnBusyWorkers(t *testing.T) {
-	a := newTestAPI(t, 1, sleepExecutor{delay: 300 * time.Millisecond})
+	a := newTestAPI(t, 1, testutil.SleepExecutor{Delay: 300 * time.Millisecond})
 
 	first := doJSON(t, a.Routes(), http.MethodPost, "/tasks", map[string]any{"cmd": []string{"x"}})
 	if first.Code != http.StatusAccepted {
@@ -199,7 +223,7 @@ func TestSubmit_DoesNotBlockOnBusyWorkers(t *testing.T) {
 }
 
 func TestStats(t *testing.T) {
-	a := newTestAPI(t, 2, sleepExecutor{delay: 200 * time.Millisecond})
+	a := newTestAPI(t, 2, testutil.SleepExecutor{Delay: 200 * time.Millisecond})
 	for i := 0; i < 3; i++ {
 		doJSON(t, a.Routes(), http.MethodPost, "/tasks", map[string]any{"cmd": []string{"x"}})
 	}
@@ -232,7 +256,7 @@ func TestStats(t *testing.T) {
 }
 
 func TestMethodNotAllowed(t *testing.T) {
-	a := newTestAPI(t, 1, sleepExecutor{delay: time.Millisecond})
+	a := newTestAPI(t, 1, testutil.SleepExecutor{Delay: time.Millisecond})
 	rec := doJSON(t, a.Routes(), http.MethodGet, "/tasks", nil)
 	if rec.Code != http.StatusMethodNotAllowed {
 		t.Errorf("status = %d, want 405", rec.Code)
@@ -240,7 +264,7 @@ func TestMethodNotAllowed(t *testing.T) {
 }
 
 func TestHealthz(t *testing.T) {
-	a := newTestAPI(t, 1, sleepExecutor{delay: time.Millisecond})
+	a := newTestAPI(t, 1, testutil.SleepExecutor{Delay: time.Millisecond})
 	rec := doJSON(t, a.Routes(), http.MethodGet, "/healthz", nil)
 	if rec.Code != http.StatusOK {
 		t.Errorf("status = %d, want 200", rec.Code)
@@ -279,5 +303,84 @@ func TestParseMemBytes(t *testing.T) {
 		if got != c.want {
 			t.Errorf("ParseMemBytes(%q) = %d, want %d", c.in, got, c.want)
 		}
+	}
+}
+
+// failExecutor always returns a non-zero exit code — a permanent failure
+// under the retry policy, so it dead-letters immediately with no retries.
+type failExecutor struct{}
+
+func (failExecutor) Execute(ctx context.Context, t task.Task) (task.Result, error) {
+	return task.Result{ExitCode: 1}, nil
+}
+
+func TestDeadLetters_ShowsPermanentFailure(t *testing.T) {
+	a, dlq := newTestAPIWithDLQ(t, 1, failExecutor{})
+
+	submitted := decodeTask(t, doJSON(t, a.Routes(), http.MethodPost, "/tasks", map[string]any{
+		"image": "alpine", "cmd": []string{"x"},
+	}))
+
+	deadline := time.Now().Add(time.Second)
+	for {
+		got := decodeTask(t, doJSON(t, a.Routes(), http.MethodGet, "/tasks/"+submitted.ID, nil))
+		if got.Status == task.StatusFailed {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("task never reached failed, last status=%s", got.Status)
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+	// Recording happens just after the store write, in the same goroutine —
+	// poll instead of assuming it landed the instant the task shows failed.
+	for {
+		if n, _ := dlq.List(context.Background(), 10); len(n) > 0 {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("dead-letter was never recorded")
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+
+	rec := doJSON(t, a.Routes(), http.MethodGet, "/dead-letters", nil)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200", rec.Code)
+	}
+	var resp struct {
+		Entries []dispatch.DeadLetterEntry `json:"entries"`
+	}
+	if err := json.Unmarshal(rec.Body.Bytes(), &resp); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	if len(resp.Entries) != 1 {
+		t.Fatalf("got %d entries, want 1", len(resp.Entries))
+	}
+	if resp.Entries[0].TaskID != submitted.ID {
+		t.Errorf("entry TaskID = %q, want %q", resp.Entries[0].TaskID, submitted.ID)
+	}
+	if resp.Entries[0].Spec.Image != "alpine" {
+		t.Errorf("entry Spec.Image = %q, want alpine (full Spec should round-trip)", resp.Entries[0].Spec.Image)
+	}
+}
+
+func TestDeadLetters_EmptyWhenNoneFailed(t *testing.T) {
+	a := newTestAPI(t, 1, testutil.SleepExecutor{Delay: time.Millisecond})
+	rec := doJSON(t, a.Routes(), http.MethodGet, "/dead-letters", nil)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200", rec.Code)
+	}
+	var resp struct {
+		Entries []dispatch.DeadLetterEntry `json:"entries"`
+	}
+	if err := json.Unmarshal(rec.Body.Bytes(), &resp); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	if resp.Entries == nil {
+		t.Error("entries = null, want an empty array (not null) when there's nothing to report")
+	}
+	if len(resp.Entries) != 0 {
+		t.Errorf("got %d entries, want 0", len(resp.Entries))
 	}
 }

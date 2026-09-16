@@ -12,9 +12,12 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/redis/go-redis/v9"
+
 	"github.com/roneettopiwala/relay/internal/api"
 	"github.com/roneettopiwala/relay/internal/dispatch"
 	"github.com/roneettopiwala/relay/internal/executor"
+	"github.com/roneettopiwala/relay/internal/queue"
 	"github.com/roneettopiwala/relay/internal/store"
 	"github.com/roneettopiwala/relay/internal/task"
 )
@@ -26,6 +29,11 @@ const shutdownGrace = 30 * time.Second
 func main() {
 	addr := flag.String("addr", ":8080", "HTTP listen address")
 	workers := flag.Int("workers", 4, "number of concurrent workers")
+	redisAddr := flag.String("redis-addr", "localhost:6379", "Redis address backing the task queue")
+	maxQueueDepth := flag.Int("max-queue-depth", 200, "reject new submissions with 503 once this many tasks are queued-or-running (0 disables backpressure)")
+	maxRetries := flag.Int("max-retries", 3, "retry a retryable failure (timeout, executor error) this many times before giving up (0 disables retries)")
+	retryBaseDelay := flag.Duration("retry-base-delay", 500*time.Millisecond, "backoff before the first retry; doubles each subsequent attempt")
+	retryMaxDelay := flag.Duration("retry-max-delay", 30*time.Second, "cap on the backoff delay between retries")
 
 	defaultImage := flag.String("default-image", "alpine", "default container image when a task omits one")
 	defaultCPUs := flag.Float64("default-cpus", 0.5, "default --cpus when a task omits one")
@@ -50,7 +58,27 @@ func main() {
 		log.Fatalf("docker executor: %v (is the Docker daemon running and reachable without sudo?)", err)
 	}
 
-	d := dispatch.New(st, *workers, exec)
+	rdb := redis.NewClient(&redis.Options{Addr: *redisAddr})
+	pingCtx, pingCancel := context.WithTimeout(context.Background(), 5*time.Second)
+	pingErr := rdb.Ping(pingCtx).Err()
+	pingCancel()
+	if pingErr != nil {
+		log.Fatalf("redis unreachable at %s: %v (is `docker run -d -p 6379:6379 redis:7-alpine` running?)", *redisAddr, pingErr)
+	}
+
+	q, err := queue.NewRedisQueue(rdb)
+	if err != nil {
+		log.Fatalf("queue: %v", err)
+	}
+	dlq := queue.NewRedisDeadLetterQueue(rdb)
+
+	d := dispatch.New(st, exec, q, dlq, dispatch.Config{
+		Workers:        *workers,
+		MaxQueueDepth:  *maxQueueDepth,
+		MaxRetries:     *maxRetries,
+		RetryBaseDelay: *retryBaseDelay,
+		RetryMaxDelay:  *retryMaxDelay,
+	})
 
 	defaults := task.Defaults{
 		Image:    *defaultImage,
@@ -59,7 +87,11 @@ func main() {
 		Timeout:  *defaultTimeout,
 	}
 
-	a := api.New(st, d, defaults, *maxCPUs, maxMemBytes, *maxTimeout)
+	a := api.New(st, d, dlq, defaults, api.Limits{
+		MaxCPU:      *maxCPUs,
+		MaxMemBytes: maxMemBytes,
+		MaxTimeout:  *maxTimeout,
+	})
 
 	srv := &http.Server{
 		Addr:              *addr,
@@ -96,6 +128,9 @@ func main() {
 	}
 	if err := d.Shutdown(shutdownCtx); err != nil {
 		log.Printf("dispatcher shutdown: %v (in-flight containers were force-cancelled)", err)
+	}
+	if err := rdb.Close(); err != nil {
+		log.Printf("redis close: %v", err)
 	}
 	log.Println("shutdown complete")
 }

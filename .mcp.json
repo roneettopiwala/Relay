@@ -1,0 +1,8 @@
+{
+  "mcpServers": {
+    "relay": {
+      "command": "go",
+      "args": ["run", "./cmd/mcpserver", "-relay-url", "http://localhost:8080"]
+    }
+  }
+}

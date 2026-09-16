@@ -22,28 +22,32 @@ import (
 // payload to decode.
 const maxBodyBytes = 1 << 20 // 1 MiB
 
-// API wires the store and dispatcher to HTTP handlers, plus the server-side
-// limits a submitted task's resource requests are checked against.
+// Limits are the server-side ceilings a submitted task's resource request is
+// validated against.
+type Limits struct {
+	MaxCPU      float64
+	MaxMemBytes int64
+	MaxTimeout  time.Duration
+}
+
+// API wires the store, dispatcher, and dead-letter queue to HTTP handlers.
 type API struct {
 	store      *store.Store
 	dispatcher *dispatch.Dispatcher
+	deadLetter dispatch.DeadLetterQueue // may be nil: GET /dead-letters then reports empty
 	defaults   task.Defaults
-
-	maxCPU      float64
-	maxMemBytes int64
-	maxTimeout  time.Duration
+	limits     Limits
 }
 
-// New builds an API. maxCPU/maxMemBytes/maxTimeout are the ceilings a client's
-// request is validated against; defaults fill in whatever a request omits.
-func New(st *store.Store, d *dispatch.Dispatcher, defaults task.Defaults, maxCPU float64, maxMemBytes int64, maxTimeout time.Duration) *API {
+// New builds an API. defaults fills in whatever a submitted spec omits;
+// limits are the ceilings it's validated against.
+func New(st *store.Store, d *dispatch.Dispatcher, dlq dispatch.DeadLetterQueue, defaults task.Defaults, limits Limits) *API {
 	return &API{
-		store:       st,
-		dispatcher:  d,
-		defaults:    defaults,
-		maxCPU:      maxCPU,
-		maxMemBytes: maxMemBytes,
-		maxTimeout:  maxTimeout,
+		store:      st,
+		dispatcher: d,
+		deadLetter: dlq,
+		defaults:   defaults,
+		limits:     limits,
 	}
 }
 
@@ -55,6 +59,7 @@ func (a *API) Routes() http.Handler {
 	mux.HandleFunc("POST /tasks", a.handleSubmit)
 	mux.HandleFunc("GET /tasks/{id}", a.handleGet)
 	mux.HandleFunc("GET /stats", a.handleStats)
+	mux.HandleFunc("GET /dead-letters", a.handleDeadLetters)
 	mux.HandleFunc("GET /healthz", a.handleHealthz)
 	return mux
 }
@@ -94,8 +99,8 @@ func (a *API) handleSubmit(w http.ResponseWriter, r *http.Request) {
 		case *req.CPUs <= 0:
 			writeError(w, http.StatusBadRequest, "cpus must be positive")
 			return
-		case *req.CPUs > a.maxCPU:
-			writeError(w, http.StatusBadRequest, fmt.Sprintf("cpus %g exceeds server maximum of %g", *req.CPUs, a.maxCPU))
+		case *req.CPUs > a.limits.MaxCPU:
+			writeError(w, http.StatusBadRequest, fmt.Sprintf("cpus %g exceeds server maximum of %g", *req.CPUs, a.limits.MaxCPU))
 			return
 		}
 		spec.CPULimit = *req.CPUs
@@ -107,8 +112,8 @@ func (a *API) handleSubmit(w http.ResponseWriter, r *http.Request) {
 			writeError(w, http.StatusBadRequest, "invalid memory format: "+err.Error())
 			return
 		}
-		if bytes > a.maxMemBytes {
-			writeError(w, http.StatusBadRequest, fmt.Sprintf("memory %q exceeds server maximum of %d bytes", spec.MemLimit, a.maxMemBytes))
+		if bytes > a.limits.MaxMemBytes {
+			writeError(w, http.StatusBadRequest, fmt.Sprintf("memory %q exceeds server maximum of %d bytes", spec.MemLimit, a.limits.MaxMemBytes))
 			return
 		}
 	}
@@ -119,8 +124,8 @@ func (a *API) handleSubmit(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		timeout := time.Duration(*req.TimeoutSeconds) * time.Second
-		if timeout > a.maxTimeout {
-			writeError(w, http.StatusBadRequest, fmt.Sprintf("timeout_seconds %d exceeds server maximum of %s", *req.TimeoutSeconds, a.maxTimeout))
+		if timeout > a.limits.MaxTimeout {
+			writeError(w, http.StatusBadRequest, fmt.Sprintf("timeout_seconds %d exceeds server maximum of %s", *req.TimeoutSeconds, a.limits.MaxTimeout))
 			return
 		}
 		spec.Timeout = timeout
@@ -130,7 +135,11 @@ func (a *API) handleSubmit(w http.ResponseWriter, r *http.Request) {
 
 	t, err := a.dispatcher.Submit(spec)
 	if err != nil {
-		// The only failure Submit reports is dispatch.ErrShuttingDown.
+		// Every failure Submit reports — shutting down, overloaded, queue
+		// unreachable — is the same kind of thing from a client's point of
+		// view: try again shortly. Retry-After makes that explicit instead of
+		// leaving the client to guess a backoff.
+		w.Header().Set("Retry-After", "1")
 		writeError(w, http.StatusServiceUnavailable, err.Error())
 		return
 	}
@@ -171,6 +180,28 @@ func (a *API) handleStats(w http.ResponseWriter, r *http.Request) {
 		WorkersTotal: total,
 		WorkersBusy:  total - idle,
 	})
+}
+
+// deadLettersLimit caps how many entries a single GET /dead-letters call
+// returns. There's no pagination yet — Phase 2 scope is "make failures
+// inspectable at all", not a full admin API.
+const deadLettersLimit = 100
+
+type deadLettersResponse struct {
+	Entries []dispatch.DeadLetterEntry `json:"entries"`
+}
+
+func (a *API) handleDeadLetters(w http.ResponseWriter, r *http.Request) {
+	if a.deadLetter == nil {
+		writeJSON(w, http.StatusOK, deadLettersResponse{Entries: []dispatch.DeadLetterEntry{}})
+		return
+	}
+	entries, err := a.deadLetter.List(r.Context(), deadLettersLimit)
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, "list dead letters: "+err.Error())
+		return
+	}
+	writeJSON(w, http.StatusOK, deadLettersResponse{Entries: entries})
 }
 
 func (a *API) handleHealthz(w http.ResponseWriter, r *http.Request) {
