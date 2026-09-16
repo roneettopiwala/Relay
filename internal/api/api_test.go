@@ -255,6 +255,58 @@ func TestStats(t *testing.T) {
 	}
 }
 
+func TestStats_LatencyFields(t *testing.T) {
+	a := newTestAPI(t, 1, testutil.SleepExecutor{Delay: 50 * time.Millisecond})
+
+	// Before anything completes, there's no data yet — a client must be able
+	// to tell "no samples" apart from "0ms latency".
+	rec := doJSON(t, a.Routes(), http.MethodGet, "/stats", nil)
+	var before struct {
+		P50LatencyMs       int64 `json:"p50_latency_ms"`
+		LatencySampleCount int   `json:"latency_sample_count"`
+	}
+	if err := json.Unmarshal(rec.Body.Bytes(), &before); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	if before.LatencySampleCount != 0 {
+		t.Errorf("LatencySampleCount = %d before any task ran, want 0", before.LatencySampleCount)
+	}
+
+	submitted := decodeTask(t, doJSON(t, a.Routes(), http.MethodPost, "/tasks", map[string]any{"cmd": []string{"x"}}))
+	deadline := time.Now().Add(time.Second)
+	for {
+		got := decodeTask(t, doJSON(t, a.Routes(), http.MethodGet, "/tasks/"+submitted.ID, nil))
+		if got.Status == task.StatusCompleted {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("task never completed")
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+
+	rec = doJSON(t, a.Routes(), http.MethodGet, "/stats", nil)
+	var after struct {
+		P50LatencyMs       int64 `json:"p50_latency_ms"`
+		P99LatencyMs       int64 `json:"p99_latency_ms"`
+		LatencySampleCount int   `json:"latency_sample_count"`
+	}
+	if err := json.Unmarshal(rec.Body.Bytes(), &after); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	if after.LatencySampleCount != 1 {
+		t.Errorf("LatencySampleCount = %d, want 1", after.LatencySampleCount)
+	}
+	// The fake executor took ~50ms; a huge margin either side just guards
+	// against "this field is wired up at all", not exact timing.
+	if after.P50LatencyMs < 20 || after.P50LatencyMs > 500 {
+		t.Errorf("P50LatencyMs = %d, want roughly 50 (the executor's delay)", after.P50LatencyMs)
+	}
+	if after.P99LatencyMs < after.P50LatencyMs {
+		t.Errorf("P99LatencyMs = %d, want >= P50LatencyMs = %d", after.P99LatencyMs, after.P50LatencyMs)
+	}
+}
+
 func TestMethodNotAllowed(t *testing.T) {
 	a := newTestAPI(t, 1, testutil.SleepExecutor{Delay: time.Millisecond})
 	rec := doJSON(t, a.Routes(), http.MethodGet, "/tasks", nil)

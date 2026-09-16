@@ -1,0 +1,54 @@
+@import "tailwindcss";
+
+/* Dark-only by design — this is an ops dashboard (queue depth, worker
+   utilization, failures), the kind of tool that's conventionally dark-only
+   (Grafana, Datadog dark mode) rather than something needing a light/dark
+   toggle. Neutral-black surfaces (no warm/cool tint) to match the reference
+   aesthetic; status/info hues are the dataviz skill's validated palette,
+   re-validated against this exact surface (see build notes) rather than
+   eyeballed. */
+:root {
+  color-scheme: dark;
+
+  /* surfaces */
+  --page: #0a0a0a;
+  --surface: #111113;
+  --surface-raised: #18181b;
+  --border: #262626;
+
+  /* ink */
+  --ink-primary: #ededed;
+  --ink-secondary: #a3a3a3;
+  --ink-muted: #737373;
+
+  /* chart chrome */
+  --grid: #1f1f22;
+  --line: #ededed; /* the default monochrome trend-line color, matching the reference */
+
+  /* status (fixed — never themed; see dataviz skill's palette.md) */
+  --status-good: #0ca30c; /* completed */
+  --status-warning: #fab219; /* retrying */
+  --status-critical: #d03b3b; /* failed */
+  --status-info: #3987e5; /* running */
+}
+
+@theme inline {
+  --color-page: var(--page);
+  --color-surface: var(--surface);
+  --color-surface-raised: var(--surface-raised);
+  --color-border: var(--border);
+  --color-ink-primary: var(--ink-primary);
+  --color-ink-secondary: var(--ink-secondary);
+  --color-ink-muted: var(--ink-muted);
+  --color-status-good: var(--status-good);
+  --color-status-warning: var(--status-warning);
+  --color-status-critical: var(--status-critical);
+  --color-status-info: var(--status-info);
+  --font-sans: var(--font-geist-sans);
+  --font-mono: var(--font-geist-mono);
+}
+
+body {
+  background: var(--page);
+  color: var(--ink-primary);
+}

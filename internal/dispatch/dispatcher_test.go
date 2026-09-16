@@ -717,6 +717,12 @@ func TestDeadLetter_RecordedForPermanentFailure(t *testing.T) {
 	if entry := dlq.last(); entry.Attempts != 1 {
 		t.Errorf("entry.Attempts = %d, want 1 (no retries happened)", entry.Attempts)
 	}
+	// metrics.Record happens right before recordDeadLetter in run() (see
+	// dispatcher.go), so by the time waitDLQCount above observed the DLQ
+	// entry, the latency sample is already in too.
+	if n := d.MetricsSnapshot().SampleCount; n != 1 {
+		t.Errorf("MetricsSnapshot().SampleCount = %d, want 1 (a permanent failure is still a latency sample)", n)
+	}
 }
 
 // TestDeadLetter_NotRecordedOnShutdownCancel checks a task that fails only
@@ -750,5 +756,44 @@ func TestDeadLetter_NotRecordedOnShutdownCancel(t *testing.T) {
 	}
 	if n := dlq.count(); n != 0 {
 		t.Errorf("dead-letter count = %d, want 0 (a shutdown-cancelled task shouldn't be dead-lettered)", n)
+	}
+	// Same exclusion applies to latency metrics: a duration cut short by
+	// shutdown isn't a meaningful sample of "how long does this task take".
+	if n := d.MetricsSnapshot().SampleCount; n != 0 {
+		t.Errorf("metrics sample count = %d, want 0 (a shutdown-cancelled task shouldn't be recorded)", n)
+	}
+}
+
+// TestMetricsSnapshot_RecordsCompletedTasks checks a successful task
+// contributes a latency sample — this is the data behind the Phase 5
+// dashboard's P50/P99 numbers. The failure-path equivalent is checked
+// alongside TestDeadLetter_RecordedForPermanentFailure, which already has a
+// permanently-failing executor set up.
+func TestMetricsSnapshot_RecordsCompletedTasks(t *testing.T) {
+	exec := newFakeExecutor(30*time.Millisecond, 0)
+	st := store.New()
+	q := testutil.NewFakeQueue()
+	d := dispatch.New(st, exec, q, nil, dispatch.Config{Workers: 1})
+	defer d.Shutdown(context.Background())
+
+	for i := 0; i < 2; i++ {
+		tk, err := d.Submit(task.Spec{Timeout: time.Second})
+		if err != nil {
+			t.Fatalf("Submit: %v", err)
+		}
+		waitTerminal(t, st, tk.ID, time.Second)
+	}
+
+	deadline := time.Now().Add(time.Second)
+	for d.MetricsSnapshot().SampleCount < 2 {
+		if time.Now().After(deadline) {
+			t.Fatalf("SampleCount = %d after 1s, want 2", d.MetricsSnapshot().SampleCount)
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+
+	s := d.MetricsSnapshot()
+	if s.P50 < 20*time.Millisecond || s.P50 > 500*time.Millisecond {
+		t.Errorf("P50 = %s, want roughly 30ms (the executor's delay)", s.P50)
 	}
 }

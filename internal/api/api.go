@@ -156,9 +156,12 @@ func (a *API) handleGet(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, t)
 }
 
-// statsResponse is the Phase 5 dashboard seam: everything it needs (queue
-// depth, worker utilization) is already tracked by store.Stats and the
-// dispatcher's pool, so this handler is just arithmetic, not new state.
+// statsResponse is the Phase 5 dashboard seam. Most of it (queue depth,
+// worker utilization) is already tracked by store.Stats and the dispatcher's
+// pool — this handler is just arithmetic, not new state. The latency fields
+// come from the dispatcher's rolling window (internal/metrics): a live
+// snapshot, not history — the dashboard builds its own trend by polling this
+// repeatedly, so Relay never needs to store a time-series itself.
 type statsResponse struct {
 	Pending      int `json:"pending"`
 	Running      int `json:"running"`
@@ -166,19 +169,30 @@ type statsResponse struct {
 	Failed       int `json:"failed"`
 	WorkersTotal int `json:"workers_total"`
 	WorkersBusy  int `json:"workers_busy"`
+
+	// P50LatencyMs/P99LatencyMs/LatencySampleCount are 0 until at least one
+	// task has reached a terminal state — the dashboard should treat a
+	// sample count of 0 as "no data yet", not "0ms latency".
+	P50LatencyMs       int64 `json:"p50_latency_ms"`
+	P99LatencyMs       int64 `json:"p99_latency_ms"`
+	LatencySampleCount int   `json:"latency_sample_count"`
 }
 
 func (a *API) handleStats(w http.ResponseWriter, r *http.Request) {
 	s := a.store.Stats()
 	total := a.dispatcher.WorkersTotal()
 	idle := a.dispatcher.WorkersIdle()
+	m := a.dispatcher.MetricsSnapshot()
 	writeJSON(w, http.StatusOK, statsResponse{
-		Pending:      s.Pending,
-		Running:      s.Running,
-		Completed:    s.Completed,
-		Failed:       s.Failed,
-		WorkersTotal: total,
-		WorkersBusy:  total - idle,
+		Pending:            s.Pending,
+		Running:            s.Running,
+		Completed:          s.Completed,
+		Failed:             s.Failed,
+		WorkersTotal:       total,
+		WorkersBusy:        total - idle,
+		P50LatencyMs:       m.P50.Milliseconds(),
+		P99LatencyMs:       m.P99.Milliseconds(),
+		LatencySampleCount: m.SampleCount,
 	})
 }
 

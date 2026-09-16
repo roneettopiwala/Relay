@@ -12,6 +12,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/roneettopiwala/relay/internal/metrics"
 	"github.com/roneettopiwala/relay/internal/store"
 	"github.com/roneettopiwala/relay/internal/task"
 )
@@ -63,6 +64,7 @@ type Dispatcher struct {
 	executor   Executor
 	queue      Queue
 	deadLetter DeadLetterQueue // may be nil: DLQ recording is then skipped entirely
+	metrics    *metrics.Recorder
 	pool       chan *Worker
 	cfg        Config
 
@@ -116,11 +118,16 @@ func New(st *store.Store, exec Executor, q Queue, dlq DeadLetterQueue, cfg Confi
 		executor:   exec,
 		queue:      q,
 		deadLetter: dlq,
-		pool:       newPool(cfg.Workers),
-		cfg:        cfg,
-		baseCtx:    ctx,
-		cancel:     cancel,
-		loopDone:   make(chan struct{}),
+		// Unlike Executor/Queue/DeadLetterQueue, there's no "real vs fake"
+		// split for this — it's pure in-memory bookkeeping with no I/O, so
+		// Dispatcher just owns one rather than taking it as a constructor
+		// dependency.
+		metrics:  metrics.New(),
+		pool:     newPool(cfg.Workers),
+		cfg:      cfg,
+		baseCtx:  ctx,
+		cancel:   cancel,
+		loopDone: make(chan struct{}),
 	}
 	go func() {
 		d.loop()
@@ -178,6 +185,11 @@ func (d *Dispatcher) WorkersTotal() int { return cap(d.pool) }
 
 // WorkersIdle returns how many workers are currently free.
 func (d *Dispatcher) WorkersIdle() int { return len(d.pool) }
+
+// MetricsSnapshot returns current P50/P99 latency over recent terminal
+// tasks (see internal/metrics) — the data behind the dashboard's latency
+// numbers.
+func (d *Dispatcher) MetricsSnapshot() metrics.Snapshot { return d.metrics.Snapshot() }
 
 // loop is the single dispatch goroutine: pull the next pending task id from
 // the queue, wait for a free worker (this is the backpressure point — it
@@ -317,6 +329,7 @@ func (d *Dispatcher) run(id, ackID string, w *Worker) {
 		retryable = false
 		reason = fmt.Sprintf("exit code %d", result.ExitCode)
 	default:
+		d.metrics.Record(time.Since(started))
 		d.store.Update(id, func(t *task.Task) {
 			now := time.Now()
 			t.FinishedAt = &now
@@ -357,6 +370,11 @@ func (d *Dispatcher) run(id, ackID string, w *Worker) {
 	})
 
 	if !dueToShutdown {
+		// Same exclusion as the dead-letter record just below: a
+		// shutdown-cancelled duration isn't a meaningful latency sample —
+		// it's an artifact of when the process happened to stop, not how
+		// long the task actually took.
+		d.metrics.Record(time.Since(started))
 		d.recordDeadLetter(id, tk.Spec, finalReason, tk.Attempts+1)
 	}
 }
